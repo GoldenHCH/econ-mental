@@ -6,14 +6,25 @@ editor: visual
 
 ## Import Libraries
 
-Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+```{r}
+library(ggplot2)
+library(tidyverse)
+```
 
-## Running Code
+## Load all the data in CSV files
 
 When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
 
 ```{r}
-1 + 1
+GDP <- read.csv("data/GDP.CSV") #GDP
+PCE <- read.csv("data/PCE.csv") #Personal Consumption Expenditure
+PI <- read.csv("data/PI.csv") #Personal Income
+PSR <- read.csv("data'PSAVERT.csv") #Personal Savings Rate
+UNRATE <- read.csv("data/UNRATE.csv") #Unemployment Rate
+patient <- read.csv("data/Patient.csv") #number of adults seeking therapy
+ment_trend <- read.csv("data/ment_trend.csv") #mental health trend on Google
+calm <- read.csv("data/calm_downloads.csv") #calm downloads
+
 ```
 
 You can add options to executable code like this
