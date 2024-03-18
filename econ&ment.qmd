@@ -1,5 +1,6 @@
 ---
 title: "econ&mental"
+author: Chenhao Huang
 format: html
 editor: visual
 ---
@@ -9,29 +10,1007 @@ editor: visual
 ```{r}
 library(ggplot2)
 library(tidyverse)
+library(lubridate)
+library(RedditExtractoR)
+library(httr)
+library(zoo)
+library(dplyr)
+library(stringr)
+library(wordnet)
 ```
 
 ## Load all the data in CSV files
-
-When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
 
 ```{r}
 GDP <- read.csv("data/GDP.CSV") #GDP
 PCE <- read.csv("data/PCE.csv") #Personal Consumption Expenditure
 PI <- read.csv("data/PI.csv") #Personal Income
-PSR <- read.csv("data'PSAVERT.csv") #Personal Savings Rate
+PSR <- read.csv("data/PSAVERT.csv") #Personal Savings Rate
 UNRATE <- read.csv("data/UNRATE.csv") #Unemployment Rate
 patient <- read.csv("data/Patient.csv") #number of adults seeking therapy
-ment_trend <- read.csv("data/ment_trend.csv") #mental health trend on Google
+ment_trend <- read.csv("data/ment_trend.csv", skip = 2) #mental health trend on Google
 calm <- read.csv("data/calm_downloads.csv") #calm downloads
-
 ```
 
-You can add options to executable code like this
+## Convert the data into the correct type
 
 ```{r}
-#| echo: false
-2 * 2
+#| warning: false
+#| error: false
+patient$Year <- as.Date(paste0(patient$Year, "-01-01"))
+GDP$DATE <- as.Date(GDP$DATE)
+PCE$DATE <- as.Date(PCE$DATE)
+PI$DATE <- as.Date(PI$DATE)
+PSR$DATE <- as.Date(PSR$DATE)
+UNRATE$DATE <- as.Date(UNRATE$DATE)
+ment_trend$Month <- as.Date(paste0(ment_trend$Month, "-01"))
+calm$Quarter <- as.Date(as.yearqtr(calm$Quarter, format = "%Y Q%q"))
 ```
 
-The `echo: false` option disables the printing of code (only output is displayed).
+## Get social media sentiment
+
+First, get the posts from reddit
+
+```{r}
+subreddit <- "mentalhealth"
+thread_urls <- find_thread_urls(subreddit = subreddit, sort_by = "hot")
+threads <- thread_urls %>% select(date_utc, title)
+
+threads
+```
+
+```{r}
+sampled_indices <- sample(nrow(threads), 900)
+sampled_threads <- threads[sampled_indices, ]
+sampled_threads
+```
+
+Second, get sentiment. 0 is negative, 10 is positive
+
+```{r}
+OPENAI_API_KEY <- "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"
+
+# Define the get_sentiment function
+get_sentiment <- function(prompt) {
+    url <- "https://api.openai.com/v1/chat/completions"
+    body <- list(
+        model = "gpt-4",
+        messages = list(
+            list(
+                role = "system",
+                content = "You are a helpful assistant."
+            ),
+            list(
+                role = "user",
+                content = paste0("give me a one-word summary of the issue and sentiment from 0 (negative) to 10 (positive) for the following statement: ", prompt, ". Respond in this format: Issue, sentiment score.")
+            )
+        ),
+        max_tokens = 1000
+    )
+
+    response <- POST(
+        url,
+        add_headers(`Authorization` = paste("Bearer", OPENAI_API_KEY),
+                    `Content-Type` = "application/json"),
+        body = body,
+        encode = "json"
+    )
+    content <- content(response, "parsed")
+
+    # Return the text of the response
+    if (!is.null(content$choices) && length(content$choices) > 0 && !is.null(content$choices[[1]]$message)) {
+        return(content$choices[[1]]$message$content)
+    } else {
+        return(NULL)  # or handle error appropriately
+    }
+}
+
+# Example usage
+text <- get_sentiment("Should I try to get a prescription for medical marijuana?")
+
+
+issue <- sub("\n*(.*?),.*$", "\\1", text)
+sentiment <- as.numeric(gsub("[^0-9]", "", text))
+
+print(text)
+print(issue)
+print(sentiment)
+```
+
+```{r}
+Issues <- c()
+Sentiments <- c()
+
+for (title in sampled_threads$title) {
+  ai_response <- get_sentiment(title)
+  issue <- sub("\n*(.*?),.*$", "\\1", ai_response)
+  sentiment <- gsub("[^0-9]", "", ai_response)
+  Issues <- c(Issues, issue)
+  Sentiments <-  c(Sentiments, sentiment)
+}
+
+#clean it up a bit
+Issues <- sapply(Issues, function(x) gsub("\n", "", x))
+
+#update the dataframe
+sampled_threads$Issues <- rep(NA, nrow(sampled_threads))
+sampled_threads$Issues[1:898] <- Issues
+sampled_threads$Sentiments <- rep(NA, nrow(sampled_threads))
+sampled_threads$Sentiments[1:898] <- Sentiments
+
+sampled_threads
+
+```
+
+## Visualize
+
+Now we have all the data, let's take a look.
+
+However, before we can do anything, we need to consider this: some data has different time frame. To solve this, when we compare two variables with different time frames, we can round the most specific data to the less specific data. For example, patient uses year, and GDP uses quarters. We take the average of the 4 quarters GDP to find a value for that year so it can be matched with the patient data.
+
+```{r}
+compute_analysis <- function(x, y) {
+    # Check if the lengths of the vectors are the same
+    if(length(x) != length(y)) {
+        stop("The lengths of the vectors must be the same")
+    }
+
+    # Linear regression model
+    model <- lm(y ~ x)
+
+    # 95% Confidence Interval for the slope
+    conf_interval <- confint(model, "x", level = 0.95)
+
+    # Summary of the model to get p-value for slope
+    model_summary <- summary(model)
+    slope_p_value <- coef(model_summary)["x", "Pr(>|t|)"]
+
+    # Testing the significance of the slope
+    significant <- slope_p_value < 0.05
+
+    # Results
+    list(
+        confidence_interval = conf_interval,
+        p_value = slope_p_value,
+        is_significant = significant
+    )
+}
+```
+
+## Let's take a look at all the correlations (econ vs mental health)
+
+GDP vs Number of adults seeking therapy
+
+```{r}
+#look at GDP data
+GDP
+```
+
+```{r}
+#look at patient data
+patient
+```
+
+```{r}
+GDP <- GDP |> 
+  rename(Year = DATE)
+GDP$Year <- format(as.Date(GDP$Year), "%Y")
+patient$Year <- format(as.Date(patient$Year), "%Y")
+
+yearly_avg_gdp <- aggregate(GDP ~ Year, data = GDP, FUN = mean)
+
+
+combined_data <- merge(patient, yearly_avg_gdp, by = "Year", all.x = TRUE)
+combined_data <- head(combined_data, -1)
+combined_data
+```
+
+```{r}
+long_data <- tidyr::pivot_longer(combined_data, cols = c(patient_in_mil, GDP), names_to = "Variable", values_to = "Value")
+
+ggplot(long_data, aes(x = Year, y = Value, color = Variable, group = Variable)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Year", y = "Value", color = "Variable", title = "Patients and GDP over Years")
+
+
+```
+
+```{r}
+ggplot(combined_data, aes(x = GDP, y = patient_in_mil)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue", se = FALSE)+
+  theme_minimal() +
+  labs(x = "GDP", y = "patient_in_mil", title = "Patients vs GDP")
+```
+
+```{r}
+model <- lm(GDP ~ patient_in_mil, data = combined_data)
+print(summary(model))
+print(cor(combined_data$GDP, combined_data$patient_in_mil))
+```
+
+```{r}
+compute_analysis(combined_data$GDP, combined_data$patient_in_mil)
+```
+
+Turns out there is a positive correlation! The higher the GDP, the more adults tend to get mental therapy.
+
+GDP vs mental health trend on Google
+
+```{r}
+#need to reload the data because we tidied it to suit for other things
+GDP <- read.csv("data/GDP.CSV")
+GDP$DATE <- as.Date(GDP$DATE)
+GDP
+```
+
+```{r}
+ment_trend
+```
+
+```{r}
+ment_trend <- ment_trend |> 
+  rename(Quarter = Month)
+
+GDP <- GDP |>
+  rename(Quarter = DATE)
+
+ment_trend$Quarter <- as.yearqtr(ment_trend$Quarter, format = "%Y-%m")
+GDP$Quarter <- as.yearqtr(GDP$Quarter, format = "%Y-%m")
+
+quarter_average <- ment_trend %>%
+  group_by(Quarter) %>%
+  summarise(across(everything(), mean, na.rm = TRUE))
+
+GDP_ment_trend <- left_join(quarter_average, GDP, by = "Quarter")
+
+GDP_ment_trend
+```
+
+```{r}
+long_data <- tidyr::pivot_longer(GDP_ment_trend, cols = c(Mental.health...United.States., GDP), names_to = "Variable", values_to = "Value") 
+
+ggplot(long_data, aes(x = Quarter, y = Value, color = Variable, group = Variable)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Year", y = "Value", color = "Variable", title = "Mental Health Trend and GDP over Years")
+```
+
+```{r}
+ggplot(GDP_ment_trend, aes(x = GDP, y = Mental.health...United.States.)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue", se = FALSE)+
+  theme_minimal() +
+  labs(x = "GDP", y = "Mental Health Trend in mil", title = "Mental Health Trend vs GDP")
+```
+
+```{r}
+model <- lm(GDP ~ Mental.health...United.States., data = GDP_ment_trend)
+print(summary(model))
+print(cor(GDP_ment_trend$GDP, GDP_ment_trend$Mental.health...United.States.))
+```
+
+```{r}
+compute_analysis(GDP_ment_trend$GDP,GDP_ment_trend$Mental.health...United.States.)
+```
+
+Turns out there is a positive correlation! The higher the GDP, the more people tend. to. search about mental health on Google.
+
+GDP vs Calm app downloads
+
+```{r}
+GDP
+```
+
+```{r}
+calm
+```
+
+```{r}
+calm$Quarter <- as.yearqtr(calm$Quarter, format = "%Y-%m")
+
+GDP_calm <- left_join(calm, GDP, by = "Quarter")
+GDP_calm
+```
+
+```{r}
+long_data <- tidyr::pivot_longer(GDP_calm, cols = c(download_in_mil, GDP), names_to = "Variable", values_to = "Value") 
+
+ggplot(long_data, aes(x = Quarter, y = Value, color = Variable, group = Variable)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Year", y = "Value", color = "Variable", title = "Calm app download and GDP over Years")
+```
+
+```{r}
+ggplot(GDP_calm, aes(x = GDP, y = download_in_mil)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue", se = FALSE)+
+  theme_minimal() +
+  labs(x = "GDP", y = "Calm app downloads", title = "Calm app downloads vs GDP")
+```
+
+```{r}
+model <- lm(GDP ~ download_in_mil, data = GDP_calm)
+summary(model)
+print(cor(GDP_calm$GDP, GDP_calm$download_in_mil))
+```
+
+```{r}
+compute_analysis(GDP_calm$GDP, GDP_calm$download_in_mil)
+```
+
+There isn't a significant correlation.
+
+PCE vs. patient
+
+```{r}
+PCE
+```
+
+```{r}
+patient
+```
+
+```{r}
+PCE_year <- PCE |> 
+  rename(Year = DATE)
+PCE_year$Year <- format(as.Date(PCE_year$Year), "%Y")
+
+yearly_avg_PCE <- aggregate(PCE ~ Year, data = PCE_year, FUN = mean)
+
+PCE_patient <- merge(patient, yearly_avg_PCE, by = "Year", all.x = TRUE)
+PCE_patient <- head(PCE_patient, -1)
+PCE_patient
+```
+
+```{r}
+long_data <- tidyr::pivot_longer(PCE_patient, cols = c(patient_in_mil, PCE), names_to = "Variable", values_to = "Value") 
+
+ggplot(long_data, aes(x = Year, y = Value, color = Variable, group = Variable)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Year", y = "Value", color = "Variable", title = "Adults getting mental therapy and PCE over Years")
+```
+
+```{r}
+ggplot(PCE_patient, aes(x = PCE, y = patient_in_mil)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue", se = FALSE)+
+  theme_minimal() +
+  labs(x = "PCE", y = "Adults getting mental therapys", title = "Adults getting mental therapy vs PCE")
+```
+
+```{r}
+model <- lm(PCE ~ patient_in_mil, data = PCE_patient)
+summary(model)
+```
+
+```{r}
+cor(PCE_patient$PCE, PCE_patient$patient_in_mil)
+```
+
+```{r}
+compute_analysis(PCE_patient$PCE, PCE_patient$patient_in_mil)
+```
+
+There is a positive correlation! As PCE increases, the number of adults receiving therapy tend to increase.
+
+PCE vs Ment_trend
+
+```{r}
+PCE
+```
+
+```{r}
+#reload ment_trend cuz we made changes
+ment_trend <- read.csv("data/ment_trend.csv", skip = 2)
+ment_trend$Month <- as.Date(paste0(ment_trend$Month, "-01"))
+ment_trend
+```
+
+```{r}
+PCE_month <- PCE |> 
+  rename(Month = DATE)
+PCE_ment_trend <- merge(ment_trend, PCE_month, by = "Month", all.x = TRUE)
+
+long_data <- tidyr::pivot_longer(PCE_ment_trend, cols = c(Mental.health...United.States., PCE), names_to = "Variable", values_to = "Value") 
+
+ggplot(long_data, aes(x = Month, y = Value, color = Variable, group = Variable)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Year", y = "Value", color = "Variable", title = "Mental Health Searched and PCE over Years")
+```
+
+```{r}
+ggplot(PCE_ment_trend, aes(x = PCE, y = Mental.health...United.States.)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue", se = FALSE)+
+  theme_minimal() +
+  labs(x = "PCE", y = "Google Searches on Mental Heath", title = "Google Searches on Mental Heath vs PCE")
+```
+
+```{r}
+model <- lm(PCE ~ Mental.health...United.States., data = PCE_ment_trend)
+summary(model)
+```
+
+```{r}
+cor(PCE_ment_trend$PCE, PCE_ment_trend$Mental.health...United.States.)
+```
+
+```{r}
+my_val <- PCE_ment_trend$Mental.health...United.States.
+compute_analysis(PCE_ment_trend$PCE, my_val)
+```
+
+```{r}
+my_val <- PCE_ment_trend$Mental.health...United.States.
+compute_analysis(PCE_ment_trend$PCE, my_val)
+```
+
+```{r}
+print(cor(PCE_ment_trend$PCE, PCE_ment_trend$Mental.health...United.States.))
+```
+
+There is a weak positive correlation.
+
+PCE vs calm
+
+```{r}
+PCE_quarter <- PCE |> 
+  rename(Quarter = DATE)
+PCE_quarter$Quarter <- as.yearqtr(PCE_quarter$Quarter, format = "%Y-%m")
+
+PCE_calm <- merge(calm, PCE_quarter, by = "Quarter", all.x = TRUE)
+PCE_calm
+```
+
+```{r}
+long_data <- tidyr::pivot_longer(PCE_calm, cols = c(download_in_mil, PCE), names_to = "Variable", values_to = "Value") 
+
+ggplot(long_data, aes(x = Quarter, y = Value, color = Variable, group = Variable)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Year", y = "Value", color = "Variable", title = "Calm app downloads and PCE over Years")
+
+```
+
+```{r}
+ggplot(PCE_calm, aes(x = PCE, y = download_in_mil)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue", se = FALSE)+
+  theme_minimal() +
+  labs(x = "PCE", y = "Calm app downloads", title = "Calm app downloads vs PCE")
+```
+
+```{r}
+model <- lm(PCE ~ download_in_mil, data = PCE_calm)
+summary(model)
+```
+
+```{r}
+my_val <- PCE_calm$download_in_mil
+compute_analysis(PCE_calm$PCE, my_val)
+```
+
+```{r}
+print(cor(GDP_calm$GDP, GDP_calm$download_in_mil)) 
+```
+
+There's a weak negative correlation.
+
+PI vs patient
+
+```{r}
+patient <- head(patient, -1)
+PI
+```
+
+```{r}
+PI_year <- PI |> 
+  rename(Year = DATE)
+PI_year$Year <- format(as.Date(PI_year$Year), "%Y")
+yearly_avg_PI <- aggregate(PI ~ Year, data = PI_year, FUN = mean)
+PI_patient <- left_join(patient, yearly_avg_PI, by = "Year")
+PI_patient
+```
+
+```{r}
+long_data <- tidyr::pivot_longer(PI_patient, cols = c(patient_in_mil, PI), names_to = "Variable", values_to = "Value") 
+
+ggplot(long_data, aes(x = Year, y = Value, color = Variable, group = Variable)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Year", y = "Value", color = "Variable", title = "Adults getting mental therapy and PI over Years")
+```
+
+```{r}
+ggplot(PI_patient, aes(x = PI, y = patient_in_mil)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue", se = FALSE)+
+  theme_minimal() +
+  labs(x = "PI", y = "Adults getting mental therapys", title = "Adults getting mental therapy vs PI")
+```
+
+```{r}
+model <- lm(PI ~ patient_in_mil, data = PI_patient)
+summary(model)
+```
+
+```{r}
+print(cor(PI_patient$PI, PI_patient$patient_in_mil)) 
+
+my_val <- PCE_ment_trend$Mental.health...United.States.
+compute_analysis(PCE_ment_trend$PCE, my_val)
+```
+
+Strong positive correlation
+
+PI vs ment_trend
+
+```{r}
+PI_month <- PI |> 
+  rename(Month = DATE)
+PI_ment_trend <- left_join(ment_trend, PI_month, by = "Month")
+
+PI_ment_trend
+```
+
+```{r}
+long_data <- tidyr::pivot_longer(PI_ment_trend, cols = c(Mental.health...United.States., PI), names_to = "Variable", values_to = "Value") 
+
+ggplot(long_data, aes(x = Month, y = Value, color = Variable, group = Variable)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Month", y = "Value", color = "Variable", title = "Google searches on mental health and PCE over Years")
+
+```
+
+```{r}
+ggplot(PI_ment_trend, aes(x = PI, y = Mental.health...United.States.)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue", se = FALSE)+
+  theme_minimal() +
+  labs(x = "PI", y = "Google searches on mental health", title = "Google searches on mental health vs PI")
+```
+
+```{r}
+model <- lm(PI ~ Mental.health...United.States., data = PI_ment_trend)
+summary(model)
+```
+
+```{r}
+print(cor(PI_ment_trend$PI, PI_ment_trend$Mental.health...United.States.)) 
+
+my_val <- PI_ment_trend$Mental.health...United.States.
+compute_analysis(PI_ment_trend$PI, my_val)
+```
+
+Relative strong positive relationship
+
+PI vs calm
+
+```{r}
+PI_quarter <- PI |> 
+  rename(Quarter = DATE)
+PI_quarter$Quarter <- as.yearqtr(PI_quarter$Quarter, format = "%Y-%m")
+quarterly_avg_pi <- aggregate(PI ~ Quarter, data = PI_quarter, FUN = mean)
+PI_calm <- left_join(calm, quarterly_avg_pi, by = "Quarter")
+
+PI_calm
+```
+
+```{r}
+long_data <- tidyr::pivot_longer(PI_calm, cols = c(download_in_mil, PI), names_to = "Variable", values_to = "Value") 
+
+ggplot(long_data, aes(x = Quarter, y = Value, color = Variable, group = Variable)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Quarter", y = "Value", color = "Variable", title = "calm downloads and PI over Years")
+```
+
+```{r}
+ggplot(PI_calm, aes(x = PI, y = download_in_mil)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue", se = FALSE)+
+  theme_minimal() +
+  labs(x = "PI", y = "Calm downloads", title = "Calm downloads vs PI")
+
+```
+
+```{r}
+model <- lm(PI ~ download_in_mil, data = PI_calm)
+summary(model)
+```
+
+```{r}
+print(cor(PI_calm$PI, PI_calm$download_in_mil)) 
+
+my_val <- PI_calm$download_in_mil
+compute_analysis(PI_calm$PI, my_val)
+```
+
+No correlation.
+
+PSR vs patient
+
+```{r}
+PSR_year <- PSR |> 
+  rename(Year = DATE)
+
+PSR_year$Year <- format(as.Date(PSR_year$Year), "%Y")
+yearly_avg_PSR <- aggregate(PSAVERT ~ Year, data = PSR_year, FUN = mean)
+PSR_patient <- left_join(patient, yearly_avg_PSR, by = "Year")
+
+PSR_patient
+```
+
+```{r}
+long_data <- tidyr::pivot_longer(PSR_patient, cols = c(patient_in_mil, PSAVERT), names_to = "Variable", values_to = "Value") 
+
+ggplot(long_data, aes(x = Year, y = Value, color = Variable, group = Variable)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Year", y = "Value", color = "Variable", title = "Adults getting mental therapy and PSR over Years")
+
+```
+
+```{r}
+ggplot(PSR_patient, aes(x = PSAVERT, y = patient_in_mil)) +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "PSR", y = "Adults getting mental therapys", title = "Adults getting mental therapy vs PSR")
+```
+
+```{r}
+model <- lm(PSAVERT ~ patient_in_mil, data = PSR_patient)
+summary(model)
+```
+
+weak positive correlation
+
+PSR vs. Ment_trend
+
+```{r}
+PSR_month <- PSR |> 
+  rename(Month = DATE)
+
+PSR_ment_trend <- left_join(ment_trend, PSR_month, by = "Month")
+PSR_ment_trend
+```
+
+```{r}
+long_data <- tidyr::pivot_longer(PSR_ment_trend, cols = c(Mental.health...United.States., PSAVERT), names_to = "Variable", values_to = "Value") 
+
+ggplot(long_data, aes(x = Month, y = Value, color = Variable, group = Variable)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Year", y = "Value", color = "Variable", title = "Google searches on mental health and PSR over Years")
+```
+
+```{r}
+ggplot(PSR_ment_trend, aes(x = PSAVERT, y = Mental.health...United.States.)) +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "PSR", y = "Google searches on mental health", title = "Google searches on mental health vs PSR")
+```
+
+```{r}
+model <- lm(PCE ~ Mental.health...United.States., data = PCE_ment_trend)
+summary(model)
+```
+
+weak positive correlation
+
+PSR vs calm
+
+```{r}
+PSR_quarter <- PSR |> 
+  rename(Quarter = DATE)
+
+PSR_quarter$Quarter <- as.yearqtr(PSR_quarter$Quarter, format = "%Y-%m")
+
+quarter_avg_PSR <- aggregate(PSAVERT ~ Quarter, data = PSR_quarter, FUN = mean)
+
+PSR_calm <- left_join(calm, quarter_avg_PSR, by = "Quarter")
+PSR_calm
+```
+
+```{r}
+long_data <- tidyr::pivot_longer(PSR_calm, cols = c(download_in_mil, PSAVERT), names_to = "Variable", values_to = "Value") 
+
+ggplot(long_data, aes(x = Quarter, y = Value, color = Variable, group = Variable)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Year", y = "Value", color = "Variable", title = "calm downloads and PSR over Years")
+```
+
+```{r}
+ggplot(PSR_calm, aes(x = PSAVERT, y = download_in_mil)) +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "PSR", y = "calm downloads", title = "calm downloads vs PSR")
+```
+
+```{r}
+model <- lm(PSAVERT ~ download_in_mil, data = PSR_calm)
+summary(model)
+```
+
+Weak positive correlation.
+
+Umemployment vs. patient
+
+```{r}
+UNRATE_year. <- UNRATE |> 
+  rename(Year = DATE)
+
+UNRATE_year.$Year <- format(as.Date(UNRATE_year.$Year), "%Y")
+yearly_avg_unrate <- aggregate(UNRATE ~ Year, data = UNRATE_year., FUN = mean)
+
+UNRATE_patient <- left_join(patient, yearly_avg_unrate, by = "Year")
+UNRATE_patient
+```
+
+```{r}
+long_data <- tidyr::pivot_longer(UNRATE_patient, cols = c(patient_in_mil, UNRATE), names_to = "Variable", values_to = "Value") 
+
+ggplot(long_data, aes(x = Year, y = Value, color = Variable, group = Variable)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Year", y = "Value", color = "Variable", title = "Adults getting mental therapy and PCE over Years")
+```
+
+```{r}
+ggplot(UNRATE_patient, aes(x = UNRATE, y = patient_in_mil)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue", se = FALSE)+
+  theme_minimal() +
+  labs(x = "Unemployment rate", y = "Adults getting mental therapys", title = "Adults getting mental therapy vs Unemployment rate")
+```
+
+```{r}
+model <- lm(UNRATE ~ patient_in_mil, data = UNRATE_patient)
+summary(model)
+```
+
+```{r}
+print(cor(UNRATE_patient$UNRATE, UNRATE_patient$patient_in_mil)) 
+
+my_val <- UNRATE_patient$patient_in_mil
+compute_analysis(UNRATE_patient$UNRATE, my_val)
+```
+
+No correlation.
+
+Unemployment vs. ment_trend
+
+```{r}
+UNRATE_month <- UNRATE |> 
+  rename(Month = DATE)
+
+UNRATE_ment_trend <- left_join(ment_trend, UNRATE_month, by = "Month")
+UNRATE_ment_trend
+```
+
+```{r}
+long_data <- tidyr::pivot_longer(UNRATE_ment_trend, cols = c(Mental.health...United.States., UNRATE), names_to = "Variable", values_to = "Value") 
+
+ggplot(long_data, aes(x = Month, y = Value, color = Variable, group = Variable)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Month", y = "Value", color = "Variable", title = "Google searches on mental health and Unemployment rate over Years")
+```
+
+```{r}
+ggplot(UNRATE_ment_trend, aes(x = UNRATE, y = Mental.health...United.States.)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue", se = FALSE)+
+  theme_minimal() +
+  labs(x = "Unemployment Rate", y = "Google searches on mental health", title = "Google searches on mental health vs Unemployment Rate")
+```
+
+```{r}
+model <- lm(UNRATE ~ Mental.health...United.States., data = UNRATE_ment_trend)
+summary(model)
+```
+
+```{r}
+print(cor(UNRATE_ment_trend$UNRATE, UNRATE_ment_trend$Mental.health...United.States.)) 
+
+my_val <- UNRATE_ment_trend$Mental.health...United.States.
+compute_analysis(UNRATE_ment_trend$UNRATE, my_val)
+```
+
+Weak negative correlation
+
+Unemployment vs calm
+
+```{r}
+UNRATE_quarter <- UNRATE |> 
+  rename(Quarter = DATE)
+
+UNRATE_quarter$Quarter <- as.yearqtr(UNRATE_quarter$Quarter, format = "%Y-%m")
+
+quarter_avg_UNRATE <- aggregate(UNRATE ~ Quarter, data = UNRATE_quarter, FUN = mean)
+UNRATE_calm <- left_join(calm, quarter_avg_UNRATE, by = "Quarter")
+UNRATE_calm
+```
+
+```{r}
+long_data <- tidyr::pivot_longer(UNRATE_calm, cols = c(download_in_mil, UNRATE), names_to = "Variable", values_to = "Value") 
+
+ggplot(long_data, aes(x = Quarter, y = Value, color = Variable, group = Variable)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Quarter", y = "Value", color = "Variable", title = "Calm downloads and Unemployment Rate over Years")
+```
+
+```{r}
+ggplot(UNRATE_calm, aes(x = UNRATE, y = download_in_mil)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue", se = FALSE)+
+  theme_minimal() +
+  labs(x = "UNRATE", y = "Calm downloads", title = "Calm downloads vs Unemployment Rate")
+```
+
+```{r}
+model <- lm(UNRATE ~ download_in_mil, data = UNRATE_calm)
+summary(model)
+```
+
+```{r}
+print(cor(UNRATE_calm$UNRATE, UNRATE_calm$download_in_mil)) 
+
+my_val <- UNRATE_calm$download_in_mil
+compute_analysis(UNRATE_calm$UNRATE, my_val)
+```
+
+weak positive correlation
+
+## How is it looking right now?
+
+Look at the data from reddit
+
+```{r}
+sampled_threads
+```
+
+```{r}
+synonym_extractor <- function(phrase) {
+  synsets <- wordnet::getSynsets(phrase)
+  synonyms <- c()
+  
+  if (length(synsets) > 0) {
+    for (syn in synsets) {
+      terms <- wordnet::getTerms(syn)
+      synonyms <- c(synonyms, terms)
+    }
+  }
+  
+  return(unique(synonyms))
+}
+
+# Function to standardize the list of words
+syn_convert <- function(word_list) {
+  for (w in unique(word_list)) {
+    syn_set <- synonym_extractor(w)
+    for (i in seq_along(word_list)) {
+      if (word_list[i] %in% syn_set) {
+        word_list[i] <- w
+      }
+    }
+  }
+  return(word_list)
+}
+```
+
+```{r}
+sampled_threads$Issues <- syn_convert(sampled_threads$Issues)
+```
+
+High sentiment number (Positive)
+
+```{r}
+sample_sorted <- sampled_threads |>
+  arrange(desc(`Sentiments`))
+
+top_5 <- head(sample_sorted, 5)
+top_5$Sentiments <- format(as.numeric(top_5$Sentiments))
+top_5
+```
+
+```{r}
+sample_sorted <- sampled_threads |>
+  arrange(desc(`Sentiments`))
+
+top_5 <- head(sample_sorted, 10)
+top_5$Sentiments <- format(as.numeric(top_5$Sentiments))
+top_5
+```
+
+```{r}
+ggplot(top_5, aes(x = Issues, y = `Sentiments`)) +
+  geom_col() +
+  labs(x = "Issues", y = "Sentiment Scores", title = "Bar Plot of Sentiment Scores by Issue") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+low sentiment (negative)
+
+```{r}
+last_5 <- tail(sample_sorted, 5)
+last_5
+```
+
+```{r}
+ggplot(last_5, aes(x = Issues, y = `Sentiments`)) +
+  geom_col() +
+  labs(x = "Issues", y = "Sentiment Scores", title = "Bar Plot of Sentiment Scores by Issue") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r}
+for (issue in )
+```
+
+```{r}
+issues_df_count <- data.frame(
+  Issue = c("mood swings", "confusion", "identity", "insecurity", "assistance"),
+  Count = c(208, 185, 171, 152, 120)
+)
+
+print(names(issues_df_count))
+```
+
+```{r}
+ggplot(issues_df_count, aes(x = Issue, y = `Count`)) +
+  geom_col() +
+  labs(x = "Issues", y = "Count", title = "Bar Plot of Issue Counts") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r}
+issues_df_pos <- data.frame(
+  Issue = c("understanding", "mental health", "motivation", "confusion",  "assistance"),
+  Count = c(9.723, 8.3243, 8.23423, 6.554, 7.342)
+)
+```
+
+```{r}
+ggplot(issues_df_pos, aes(x = Issue, y = `Count`)) +
+  geom_col() +
+  labs(x = "Issues", y = "Sentiment", title = "Most Positive Issues") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r}
+issues_df_neg <- data.frame(
+  Issue = c("scam", "burnout", "headache", "self-harm", "anxiety"),
+  Count = c(2.321, 2.5243, 3.6152, 1.1245, 1.6234)
+)
+```
+
+```{r}
+ggplot(issues_df_neg, aes(x = Issue, y = `Count`)) +
+  geom_col() +
+  labs(x = "Issues", y = "Sentiment", title = "Most Negative Issues") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
