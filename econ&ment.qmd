@@ -68,7 +68,7 @@ sampled_threads
 Second, get sentiment. 0 is negative, 10 is positive
 
 ```{r}
-OPENAI_API_KEY <- "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"
+
 
 # Define the get_sentiment function
 get_sentiment <- function(prompt) {
